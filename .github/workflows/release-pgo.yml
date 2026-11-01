@@ -1,19 +1,25 @@
-name: Release with PGO
+name: Patched image with PGO
 
 on:
-  workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: [v2.3.6-slatedb-local]
+  workflow_dispatch:
+    inputs:
+      slatedb_ref:
+        description: "Ref of hzhou0/slatedb to build against"
+        required: false
+        default: v0.17.0-clamp
 
 env:
   CARGO_TERM_COLOR: always
+  SLATEDB_REF: ${{ inputs.slatedb_ref || 'v0.17.0-clamp' }}
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-instrumented:
@@ -21,6 +27,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: hzhou0/slatedb
+          ref: ${{ env.SLATEDB_REF }}
+          path: slatedb-src
+
+      # zerofs/Cargo.toml patches SlateDB through a path outside this checkout.
+      - name: Place the SlateDB checkout
+        run: mv slatedb-src ../slatedb
 
       - name: Install Rust with PGO support
         uses: dtolnay/rust-toolchain@stable
@@ -389,6 +405,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/checkout@v4
+        with:
+          repository: hzhou0/slatedb
+          ref: ${{ env.SLATEDB_REF }}
+          path: slatedb-src
+
+      # zerofs/Cargo.toml patches SlateDB through a path outside this checkout.
+      - name: Place the SlateDB checkout
+        run: mv slatedb-src ../slatedb
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -420,43 +446,21 @@ jobs:
           retention-days: 1
 
   build-release:
-    name: Build optimized for ${{ matrix.target }}
+    name: Build optimized binary
     needs: [merge-pgo-data, build-webui]
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
-      attestations: write
-      id-token: write
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            arch: amd64
-            os: ubuntu-latest
-            platform: linux
-            # BOLT instrumentation can't dump a profile from a static (no-INTERP)
-            # musl binary, so we ship PGO without the BOLT pass.
-            bolt: false
-          - target: aarch64-unknown-linux-musl
-            arch: arm64
-            os: ubuntu-24.04-arm
-            platform: linux
-            bolt: false
-          - target: x86_64-apple-darwin
-            arch: x86_64
-            os: macos-latest
-            platform: darwin
-          - target: aarch64-apple-darwin
-            arch: aarch64
-            os: macos-latest
-            platform: darwin
-          - target: x86_64-unknown-freebsd
-            arch: amd64
-            os: ubuntu-latest
-            platform: freebsd
-
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: hzhou0/slatedb
+          ref: ${{ env.SLATEDB_REF }}
+          path: slatedb-src
+
+      # zerofs/Cargo.toml patches SlateDB through a path outside this checkout.
+      - name: Place the SlateDB checkout
+        run: mv slatedb-src ../slatedb
 
       - name: Download PGO profile data
         uses: actions/download-artifact@v4
@@ -471,242 +475,75 @@ jobs:
           path: webui/dist/
 
       - name: Install Rust
-        if: matrix.platform != 'freebsd'
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
 
       - name: Setup musl toolchain
-        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          TARGET_UNDERSCORE="$(echo '${{ matrix.target }}' | tr '-' '_')"
-          echo "CC_${TARGET_UNDERSCORE}=musl-gcc" >> "$GITHUB_ENV"
-
-          if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
-            echo "CFLAGS_${TARGET_UNDERSCORE}=-mno-outline-atomics" >> "$GITHUB_ENV"
-          fi
-
-      - name: Configure jemalloc page size for aarch64
-        if: startsWith(matrix.target, 'aarch64-')
-        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Setup PGO profile
-        if: matrix.platform != 'freebsd'
         run: |
           cp pgo-data/merged.profdata zerofs/
           cp pgo-data/Cargo.lock zerofs/
 
-      - name: Build with PGO (cargo)
-        if: matrix.platform != 'freebsd' && !matrix.bolt
+      - name: Build with PGO
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
-
-      - name: Build with PGO + BOLT relocs (cargo)
-        if: matrix.platform != 'freebsd' && matrix.bolt
-        run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
-
-      - name: Build on FreeBSD with PGO
-        if: matrix.platform == 'freebsd'
-        uses: vmactions/freebsd-vm@v1
-        with:
-          usesh: true
-          prepare: |
-            pkg install -y gmake curl cmake
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          run: |
-            . $HOME/.cargo/env
-            echo "Building ZeroFS for FreeBSD with PGO..."
-            echo "Rust version: $(rustc --version)"
-
-            # Copy PGO data into VM
-            cp pgo-data/merged.profdata zerofs/
-            cp pgo-data/Cargo.lock zerofs/
-
-            cd zerofs
-            RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui
-
-            file target/release/zerofs
-            ls -lh target/release/zerofs
-
-            cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
-            rm -rf target/
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target x86_64-unknown-linux-musl
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          if [ "${{ matrix.platform }}" = "freebsd" ]; then
-            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo artifacts/
-          else
-            cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
-          fi
-          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          cp zerofs/target/x86_64-unknown-linux-musl/release/zerofs artifacts/zerofs-linux-amd64-pgo
+          chmod +x artifacts/zerofs-linux-amd64-pgo
 
-      - name: Install BOLT dependencies
-        if: matrix.bolt
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc lsb-release wget software-properties-common gnupg fuse3
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          UBUNTU_CODENAME=$(lsb_release -cs)
-          echo "deb http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
-          sudo apt-get update
-          sudo apt-get install -y llvm-22 bolt-22
-          echo "/usr/lib/llvm-22/bin" | sudo tee /etc/profile.d/llvm-22.sh > /dev/null
-          echo "/usr/lib/llvm-22/bin" >> $GITHUB_PATH
-          sudo ln -sf /usr/lib/llvm-22/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a
-          sudo ln -sf /usr/lib/llvm-22/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a
-
-      - name: Start SeaweedFS for BOLT profiling
-        if: matrix.bolt
-        run: bash .github/scripts/seaweedfs.sh start bolt-profile
-
-      - name: Collect BOLT profile on PGO binary
-        if: matrix.bolt
-        run: |
-          BINARY="$(pwd)/artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
-          mkdir -p /tmp/zerofs-cache /tmp/bolt-profile
-
-          llvm-bolt $BINARY -instrument -o ${BINARY}.inst \
-            -instrumentation-file=/tmp/bolt-profile/prof \
-            -instrumentation-file-append-pid
-
-          cat > zerofs-bolt.toml << EOF
-          [cache]
-          dir = "/tmp/zerofs-cache"
-          disk_size_gb = 0.5
-          memory_size_gb = 2.0
-
-          [storage]
-          url = "s3://bolt-profile/test"
-          encryption_password = "test-password-123"
-
-          [servers.ninep]
-          addresses = ["127.0.0.1:5564"]
-
-          [aws]
-          access_key_id = "zerofsadmin"
-          secret_access_key = "zerofsadmin"
-          endpoint = "http://localhost:9000"
-          allow_http = "true"
-
-          [telemetry]
-          enabled = false
-          EOF
-
-          ${BINARY}.inst run -c zerofs-bolt.toml &
-          ZEROFS_PID=$!
-
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 5564 2>/dev/null; then
-              echo "ZeroFS 9P server is ready"
-              break
-            fi
-            sleep 1
-          done
-
-          sudo mkdir -p /mnt/zerofs
-
-          sudo ${BINARY}.inst mount --access all 127.0.0.1:5564 /mnt/zerofs &
-          for i in {1..60}; do
-            mountpoint -q /mnt/zerofs && break
-            sleep 0.5
-          done
-
-          cd /mnt/zerofs
-          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
-          tar -xf linux-7.2-rc1.tar.gz
-          cd linux-7.2-rc1
-          make tinyconfig
-          make -j$(nproc)
-          cd /mnt/zerofs
-          dd if=/dev/urandom of=500mb.bin bs=1M count=500
-          dd if=500mb.bin of=/dev/null bs=1M
-          cd /
-
-          sudo fusermount3 -u /mnt/zerofs || sudo umount /mnt/zerofs || true
-          sudo pkill -TERM -f "zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo.inst mount" || true
-          kill -TERM $ZEROFS_PID || true
-          wait $ZEROFS_PID || true
-
-          echo "BOLT profile files:"
-          ls -lh /tmp/bolt-profile/
-
-          merge-fdata /tmp/bolt-profile/prof.* -o /tmp/bolt.fdata
-
-      - name: Apply BOLT optimization
-        if: matrix.bolt
-        run: |
-          BINARY="artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
-
-          llvm-bolt $BINARY -o ${BINARY}.bolt \
-            -data=/tmp/bolt.fdata \
-            -reorder-blocks=ext-tsp \
-            -reorder-functions=cdsort \
-            -split-functions \
-            -split-all-cold \
-            -dyno-stats
-
-          mv ${BINARY}.bolt $BINARY
-          rm -f ${BINARY}.inst
-          echo "BOLT optimization applied successfully"
-          ls -lh artifacts/
-
-      - name: Generate attestation for binary
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
-
-      - name: Upload artifacts
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          name: zerofs-linux-amd64-pgo
           path: artifacts/
           retention-days: 30
 
-  create-release-bundle:
-    name: Create release bundle
+  push-image:
+    name: Build and push image
     needs: build-release
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      attestations: write
-      id-token: write
-
+      contents: read
+      packages: write
     steps:
-      - name: Download all artifacts
+      - uses: actions/checkout@v4
+
+      - name: Download binary
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          pattern: zerofs-*-pgo
+          name: zerofs-linux-amd64-pgo
 
-      - name: Create tarball
+      - name: Resolve the SlateDB commit
+        id: slatedb
+        run: echo "sha=$(git ls-remote https://github.com/hzhou0/slatedb.git "$SLATEDB_REF" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Name the image
+        id: image
         run: |
-          mkdir -p release
-          for arch_dir in artifacts/*/; do
-            if [ -d "$arch_dir" ]; then
-              cp "$arch_dir"* release/
-            fi
-          done
-          cd release
-          tar czf ../zerofs-pgo-multiplatform.tar.gz zerofs-*-pgo*
-          cd ..
-          sha256sum zerofs-pgo-multiplatform.tar.gz > zerofs-pgo-multiplatform.tar.gz.sha256
+          echo "repository=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=2.3.6-${GITHUB_SHA::12}-slatedb-${{ steps.slatedb.outputs.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload combined release
-        uses: actions/upload-artifact@v4
-        with:
-          name: zerofs-pgo-release
-          path: |
-            zerofs-pgo-multiplatform.tar.gz
-            zerofs-pgo-multiplatform.tar.gz.sha256
-          retention-days: 90
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Generate attestations
-        uses: actions/attest-build-provenance@v1
+      - uses: docker/login-action@v3
         with:
-          subject-path: |
-            zerofs-pgo-multiplatform.tar.gz
-            release/zerofs-*-pgo*
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.multiarch
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.repository }}:${{ steps.image.outputs.tag }}

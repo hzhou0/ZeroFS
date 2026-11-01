@@ -178,3 +178,8 @@ required-features = ["failpoints"]
 [[test]]
 name = "dst"
 path = "tests/dst/mod.rs"
+
+[patch.crates-io]
+slatedb = { path = "../../slatedb/slatedb" }
+slatedb-common = { path = "../../slatedb/slatedb-common" }
+slatedb-txn-obj = { path = "../../slatedb/slatedb-txn-obj" }

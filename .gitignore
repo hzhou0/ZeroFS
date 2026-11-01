@@ -32,3 +32,6 @@ jepsen/ha/.lein-failures
 /kernel/fs_context_bindings.rs
 /kernel/netfs/bindings.rs
 /kernel/vfs/layout_bindings.rs
+
+.idea
+repro
